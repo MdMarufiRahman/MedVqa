@@ -1,0 +1,55 @@
+{
+  "builder_name": "parquet",
+  "citation": "",
+  "config_name": "default",
+  "dataset_name": "vqa-rad",
+  "dataset_size": 119078942,
+  "description": "",
+  "download_checksums": {
+    "hf://datasets/flaviagiammarino/vqa-rad@bcf91e7654fb9d51c8ab6a5b82cacf3fafd2fae9/data/train-00000-of-00001-eb8844602202be60.parquet": {
+      "num_bytes": 24183983,
+      "checksum": null
+    },
+    "hf://datasets/flaviagiammarino/vqa-rad@bcf91e7654fb9d51c8ab6a5b82cacf3fafd2fae9/data/test-00000-of-00001-e5bc3d208bb4deeb.parquet": {
+      "num_bytes": 10312735,
+      "checksum": null
+    }
+  },
+  "download_size": 34496718,
+  "features": {
+    "image": {
+      "_type": "Image"
+    },
+    "question": {
+      "dtype": "string",
+      "_type": "Value"
+    },
+    "answer": {
+      "dtype": "string",
+      "_type": "Value"
+    }
+  },
+  "homepage": "",
+  "license": "",
+  "size_in_bytes": 153575660,
+  "splits": {
+    "train": {
+      "name": "train",
+      "num_bytes": 95253467,
+      "num_examples": 1793,
+      "dataset_name": "vqa-rad"
+    },
+    "test": {
+      "name": "test",
+      "num_bytes": 23825475,
+      "num_examples": 451,
+      "dataset_name": "vqa-rad"
+    }
+  },
+  "version": {
+    "version_str": "0.0.0",
+    "major": 0,
+    "minor": 0,
+    "patch": 0
+  }
+}
