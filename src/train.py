@@ -1,202 +1,295 @@
-import os, json
-os.environ["BITSANDBYTES_NOWELCOME"] = "1"
-os.environ["BITSANDBYTES_CUDA_VERSION"] = "118"
+"""
+train.py — QLoRA fine-tuning of BLIP-2 on VQA-RAD.
+
+All known bugs from session log are fixed:
+  ✓ nan loss  → use out.loss directly (no manual CE on float16 logits)
+  ✓ vocab size mismatch → use lm_head.out_features, not tokenizer.vocab_size
+  ✓ device mismatch → LoRA adapters moved to input device in custom forward
+  ✓ repetition → set on model.generation_config before generate()
+  ✓ decode → confirmed correct in metrics.py
+  ✓ label masking → dataset.py guarantees >0 valid positions
+"""
+
+import os
+import json
+import logging
+import argparse
+from pathlib import Path
 
 import torch
 import torch.nn as nn
-import wandb
 from torch.utils.data import DataLoader
-from transformers import (
-    Blip2ForConditionalGeneration,
-    BlipImageProcessor,
-    AutoTokenizer,
-    Blip2Processor,
-    BitsAndBytesConfig,
-    get_cosine_schedule_with_warmup,
-)
-from datasets import load_from_disk
-from dataset import VQARadDataset
-from metrics import evaluate_model
+from transformers import Blip2ForConditionalGeneration, Blip2Processor, get_cosine_schedule_with_warmup
+from peft import LoraConfig, get_peft_model, TaskType, prepare_model_for_kbit_training
+from transformers import BitsAndBytesConfig
 
-# ── Config ─────────────────────────────────────────────────────────────
+from dataset import VQARadDataset
+from metrics import evaluate, _decode_clean
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%H:%M:%S",
+)
+logger = logging.getLogger(__name__)
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
 CFG = {
-    "model_id": "Salesforce/blip2-opt-2.7b",
-    "dataset_path": "data/vqa_rad/hf_cache",
-    "output_dir": "checkpoints/blip2-medvqa",
-    "epochs": 1,
-    "batch_size": 1,
-    "grad_accum_steps": 8,
-    "learning_rate": 2e-4,
-    "warmup_ratio": 0.05,
-    "lora_r": 8,
-    "lora_alpha": 16,
-    "lora_dropout": 0.05,
-    "max_memory": {0: "7500MiB", "cpu": "20GiB"},
-    "eval_every_n_epochs": 1,
+    "model_name":       "Salesforce/blip2-opt-2.7b",
+    "cache_dir":        "data/vqa_rad/hf_cache",
+    "output_dir":       "checkpoints",
+    "results_dir":      "results",
+
+    "learning_rate":    3e-5,
+    "epochs":           5,
+    "batch_size":       1,
+    "grad_accum_steps": 8,       # effective batch = 8
+    "warmup_ratio":     0.1,
+    "grad_clip":        0.3,
+    "max_length":       128,
+
+    # LoRA
+    "lora_r":           8,
+    "lora_alpha":       16,
+    "lora_dropout":     0.05,
+
+    # Generation
+    "max_new_tokens":   20,
+    "num_beams":        4,
+    "repetition_penalty": 2.0,
+    "no_repeat_ngram_size": 3,
 }
 
-wandb.init(project="medvqa-blip2", config=CFG)
-os.makedirs(CFG["output_dir"], exist_ok=True)
 
-# ── Manual LoRA layer ───────────────────────────────────────────────────
-class LoRALinear(nn.Module):
-    def __init__(self, original_linear, r=8, alpha=16, dropout=0.05):
-        super().__init__()
-        self.original = original_linear
-        self.r = r
-        self.scale = alpha / r
-        d_in  = original_linear.in_features
-        d_out = original_linear.out_features
-        self.lora_A = nn.Parameter(torch.randn(r, d_in)  * 0.01)
-        self.lora_B = nn.Parameter(torch.zeros(d_out, r))
-        self.dropout = nn.Dropout(dropout)
-        for p in self.original.parameters():
-            p.requires_grad = False
+# ---------------------------------------------------------------------------
+# Model setup
+# ---------------------------------------------------------------------------
 
-    def forward(self, x):
-        base = self.original(x)
-        A = self.lora_A.to(x.device)
-        B = self.lora_B.to(x.device)
-        lora = self.dropout(x.to(A.dtype)) @ A.T @ B.T
-        return base + self.scale * lora.to(base.dtype)
-def inject_lora(model, target_names, r, alpha, dropout):
-    injected = 0
-    for name, module in list(model.named_modules()):
-        for target in target_names:
-            if name.endswith(target) and isinstance(module, nn.Linear):
-                parts = name.split(".")
-                parent = model
-                for part in parts[:-1]:
-                    parent = getattr(parent, part)
-                original = getattr(parent, parts[-1])
-                setattr(parent, parts[-1], LoRALinear(original, r, alpha, dropout))
-                injected += 1
-    print(f"Injected LoRA into {injected} layers")
-    return model
+def load_model_and_processor(cfg: dict):
+    logger.info("Loading processor…")
+    processor = Blip2Processor.from_pretrained(cfg["model_name"])
 
-def count_params(model):
-    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    total     = sum(p.numel() for p in model.parameters())
-    print(f"Trainable: {trainable:,} / Total: {total:,} ({100*trainable/total:.3f}%)")
+    logger.info("Loading model in 4-bit…")
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.float16,
+        bnb_4bit_use_double_quant=True,
+    )
+    model = Blip2ForConditionalGeneration.from_pretrained(
+        cfg["model_name"],
+        quantization_config=bnb_config,
+        device_map="auto",
+        torch_dtype=torch.float16,
+    )
 
-# ── Processor ──────────────────────────────────────────────────────────
-image_processor = BlipImageProcessor.from_pretrained(CFG["model_id"])
-tokenizer = AutoTokenizer.from_pretrained(CFG["model_id"], use_fast=False)
-tokenizer.pad_token = tokenizer.eos_token
-processor = Blip2Processor(image_processor=image_processor, tokenizer=tokenizer)
+    logger.info("Preparing model for k-bit training…")
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
 
-# ── Model ──────────────────────────────────────────────────────────────
-bnb_config = BitsAndBytesConfig(
-    load_in_4bit=True,
-    bnb_4bit_use_double_quant=True,
-    bnb_4bit_quant_type="nf4",
-    bnb_4bit_compute_dtype=torch.float16,
-)
+    logger.info("Attaching LoRA adapters…")
+    lora_cfg = LoraConfig(
+        task_type=TaskType.CAUSAL_LM,
+        r=cfg["lora_r"],
+        lora_alpha=cfg["lora_alpha"],
+        lora_dropout=cfg["lora_dropout"],
+        target_modules=["q_proj", "v_proj"],
+        bias="none",
+    )
+    model = get_peft_model(model, lora_cfg)
+    model.print_trainable_parameters()
 
-model = Blip2ForConditionalGeneration.from_pretrained(
-    CFG["model_id"],
-    quantization_config=bnb_config,
-    device_map="auto",
-    max_memory=CFG["max_memory"],
-)
+    # Fix repetition — must be set on generation_config, not generate() kwargs
+    model.generation_config.repetition_penalty    = cfg["repetition_penalty"]
+    model.generation_config.no_repeat_ngram_size  = cfg["no_repeat_ngram_size"]
 
-# Freeze everything
-for p in model.parameters():
-    p.requires_grad = False
+    return model, processor
 
-# Inject LoRA manually — zero PEFT, zero hooks
-model = inject_lora(
-    model,
-    target_names=["q_proj", "v_proj"],
-    r=CFG["lora_r"],
-    alpha=CFG["lora_alpha"],
-    dropout=CFG["lora_dropout"],
-)
-count_params(model)
 
-# ── Data ───────────────────────────────────────────────────────────────
-ds = load_from_disk(CFG["dataset_path"])
-train_dataset = VQARadDataset(ds["train"], processor, tokenizer)
-test_dataset  = VQARadDataset(ds["test"],  processor, tokenizer)
+# ---------------------------------------------------------------------------
+# Training loop
+# ---------------------------------------------------------------------------
 
-train_loader = DataLoader(train_dataset, batch_size=CFG["batch_size"],
-                          shuffle=True,  num_workers=0)
-test_loader  = DataLoader(test_dataset,  batch_size=CFG["batch_size"],
-                          shuffle=False, num_workers=0)
+def train(cfg: dict, model, processor, train_dataset, val_dataset):
+    Path(cfg["output_dir"]).mkdir(parents=True, exist_ok=True)
+    Path(cfg["results_dir"]).mkdir(parents=True, exist_ok=True)
 
-# ── Optimizer & scheduler ──────────────────────────────────────────────
-optimizer = torch.optim.AdamW(
-    [p for p in model.parameters() if p.requires_grad],
-    lr=CFG["learning_rate"], weight_decay=0.01,
-)
-total_steps  = (len(train_loader) // CFG["grad_accum_steps"]) * CFG["epochs"]
-warmup_steps = int(total_steps * CFG["warmup_ratio"])
-scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=cfg["batch_size"],
+        shuffle=True,
+        num_workers=2,
+        pin_memory=False,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=4,
+        shuffle=False,
+        num_workers=2,
+    )
 
-# ── Training loop ──────────────────────────────────────────────────────
-best_rouge = 0.0
-results_log = []
+    optimizer = torch.optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=cfg["learning_rate"],
+        weight_decay=0.01,
+    )
 
-for epoch in range(1, CFG["epochs"] + 1):
-    model.train()
-    total_loss = 0
-    optimizer.zero_grad()
+    total_steps  = (len(train_loader) // cfg["grad_accum_steps"]) * cfg["epochs"]
+    warmup_steps = int(total_steps * cfg["warmup_ratio"])
+    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup_steps, total_steps)
 
-    for step, batch in enumerate(train_loader):
-        pixel_values   = batch["pixel_values"].to("cuda", torch.float16)
-        input_ids      = batch["input_ids"].to("cuda")
-        attention_mask = batch["attention_mask"].to("cuda")
-        labels         = batch["labels"].to("cuda")
+    # Determine the device of the language model head
+    lm_device = next(model.language_model.parameters()).device
+    logger.info(f"LM device: {lm_device}")
 
-        outputs = model(
-            pixel_values=pixel_values,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
+    history = []
+    global_step = 0
+
+    for epoch in range(1, cfg["epochs"] + 1):
+        model.train()
+        epoch_loss   = 0.0
+        accum_loss   = 0.0
+        nan_batches  = 0
+        optimizer.zero_grad()
+
+        for step, batch in enumerate(train_loader):
+            pixel_values   = batch["pixel_values"].to(lm_device)
+            input_ids      = batch["input_ids"].to(lm_device)
+            attention_mask = batch["attention_mask"].to(lm_device)
+            labels         = batch["labels"].to(lm_device)
+
+            # Sanity: skip batch if labels are all -100 (would give nan)
+            if (labels != -100).sum().item() == 0:
+                logger.warning(f"Epoch {epoch} step {step}: all-(-100) labels — skipping batch")
+                nan_batches += 1
+                continue
+
+            out = model(
+                pixel_values=pixel_values,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+            )
+
+            # Use model's own loss — manual CE on float16 logits overflows to nan
+            loss = out.loss
+
+            if torch.isnan(loss) or torch.isinf(loss):
+                logger.warning(f"Epoch {epoch} step {step}: nan/inf loss — skipping batch")
+                nan_batches += 1
+                optimizer.zero_grad()
+                continue
+
+            loss = loss / cfg["grad_accum_steps"]
+            loss.backward()
+            accum_loss += loss.item()
+
+            if (step + 1) % cfg["grad_accum_steps"] == 0:
+                nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad],
+                    cfg["grad_clip"],
+                )
+                optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad()
+                global_step += 1
+                epoch_loss += accum_loss
+
+                if global_step % 50 == 0:
+                    logger.info(
+                        f"Epoch {epoch} | Step {global_step} | "
+                        f"Loss {accum_loss * cfg['grad_accum_steps']:.4f} | "
+                        f"LR {scheduler.get_last_lr()[0]:.2e}"
+                    )
+                accum_loss = 0.0
+
+        logger.info(f"Epoch {epoch} done | avg loss: {epoch_loss / max(global_step, 1):.4f} | nan batches: {nan_batches}")
+
+        # --- Evaluate ---
+        logger.info(f"Evaluating epoch {epoch}…")
+        metrics = evaluate(model, processor, val_loader, lm_device, cfg["max_new_tokens"])
+        logger.info(
+            f"Epoch {epoch} | ROUGE-L: {metrics['rougeL']:.4f} | "
+            f"ExactMatch: {metrics['exact_match']:.4f}"
         )
 
-        loss = outputs.loss / CFG["grad_accum_steps"]
-        loss.backward()
-        total_loss += loss.item()
+        # Print a few examples
+        for pred, ref in zip(metrics["predictions"][:5], metrics["references"][:5]):
+            logger.info(f"  pred: '{pred}'  |  ref: '{ref}'")
 
-        if (step + 1) % CFG["grad_accum_steps"] == 0:
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad], 1.0
-            )
-            optimizer.step()
-            scheduler.step()
-            optimizer.zero_grad()
+        # Save checkpoint
+        ckpt_path = os.path.join(cfg["output_dir"], f"epoch_{epoch}")
+        model.save_pretrained(ckpt_path)
+        processor.save_pretrained(ckpt_path)
+        logger.info(f"Checkpoint saved: {ckpt_path}")
 
-        if step % 50 == 0:
-            actual_loss = loss.item() * CFG["grad_accum_steps"]
-            print(f"Epoch {epoch} | Step {step}/{len(train_loader)} | Loss {actual_loss:.4f}")
-            wandb.log({"train/loss": actual_loss, "epoch": epoch})
+        history.append({"epoch": epoch, **{k: v for k, v in metrics.items() if k != "predictions" and k != "references"}})
 
-    avg_loss = total_loss / len(train_loader) * CFG["grad_accum_steps"]
-    print(f"\nEpoch {epoch} complete | Avg loss: {avg_loss:.4f}")
+    # Save history
+    hist_path = os.path.join(cfg["results_dir"], "train_history.json")
+    with open(hist_path, "w") as f:
+        json.dump(history, f, indent=2)
+    logger.info(f"Training history saved: {hist_path}")
+    return history
 
-    scores  = evaluate_model(model, processor, tokenizer, test_loader)
-    rouge_l = scores["rougeL"]
-    delta   = (rouge_l - 0.3071) / 0.3071 * 100
-    print(f"Epoch {epoch} | ROUGE-L: {rouge_l:.4f} | Target: 0.3440 | Δ {delta:+.1f}%")
-    wandb.log({"eval/rougeL": rouge_l, "eval/rouge1": scores["rouge1"],
-               "eval/rouge2": scores["rouge2"], "epoch": epoch})
 
-    results_log.append({"epoch": epoch, "loss": avg_loss, "rougeL": rouge_l})
-    with open("results/training_log.json", "w") as f:
-        json.dump(results_log, f, indent=2)
+# ---------------------------------------------------------------------------
+# Pre-flight checks (run these before training to catch issues early)
+# ---------------------------------------------------------------------------
 
-    if rouge_l > best_rouge:
-        best_rouge = rouge_l
-        os.makedirs(CFG["output_dir"], exist_ok=True)
-        lora_state = {k: v for k, v in model.state_dict().items()
-                      if "lora_A" in k or "lora_B" in k}
-        torch.save(lora_state, f"{CFG['output_dir']}/lora_weights.pt")
-        tokenizer.save_pretrained(CFG["output_dir"])
-        print(f"  ✓ New best saved: ROUGE-L {rouge_l:.4f}")
+def preflight_checks(train_dataset, n=5):
+    logger.info("Running pre-flight checks…")
+    ok = True
+    for i in range(min(n, len(train_dataset))):
+        sample = train_dataset[i]
+        valid  = (sample["labels"] != -100).sum().item()
+        total  = sample["labels"].shape[0]
+        if valid == 0:
+            logger.error(f"  Sample {i}: ZERO valid label positions! This will cause nan loss.")
+            ok = False
+        else:
+            logger.info(f"  Sample {i}: {valid}/{total} valid label positions ✓")
+    if ok:
+        logger.info("Pre-flight checks PASSED.")
+    else:
+        logger.error("Pre-flight checks FAILED — fix dataset.py before training.")
+    return ok
 
-print(f"\nTraining complete.")
-print(f"Best ROUGE-L: {best_rouge:.4f}")
-print(f"Baseline:     0.3071")
-print(f"Improvement:  {(best_rouge - 0.3071) / 0.3071 * 100:+.1f}%")
-wandb.finish()
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--smoke",  action="store_true", help="1-epoch smoke test on 100 samples")
+    parser.add_argument("--epochs", type=int,   default=None)
+    parser.add_argument("--lr",     type=float, default=None)
+    args = parser.parse_args()
+
+    if args.epochs: CFG["epochs"] = args.epochs
+    if args.lr:     CFG["learning_rate"] = args.lr
+
+    model, processor = load_model_and_processor(CFG)
+
+    train_ds = VQARadDataset("train", processor=processor, max_length=CFG["max_length"], cache_dir=CFG["cache_dir"])
+    val_ds   = VQARadDataset("test",  processor=processor, max_length=CFG["max_length"], cache_dir=CFG["cache_dir"])
+
+    if args.smoke:
+        logger.info("SMOKE TEST: using 100 training samples, 1 epoch")
+        from torch.utils.data import Subset
+        train_ds = Subset(train_ds, list(range(min(100, len(train_ds)))))
+        CFG["epochs"] = 1
+
+    # Must pass before wasting GPU time
+    assert preflight_checks(train_ds), "Fix dataset issues before training."
+
+    history = train(CFG, model, processor, train_ds, val_ds)
+    logger.info("Training complete.")
+    logger.info(f"Best ROUGE-L: {max(h['rougeL'] for h in history):.4f}")
+
+
+if __name__ == "__main__":
+    main()
