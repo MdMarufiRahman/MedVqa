@@ -45,6 +45,7 @@ class VQARadDataset(Dataset):
     ):
         assert processor is not None, "Pass a BLIP-2 processor."
         self.processor = processor
+        self.processor.tokenizer = self.processor.tokenizer.__class__.from_pretrained( "Salesforce/blip2-opt-2.7b", use_fast=False)
         self.max_length = max_length
 
         ds = load_dataset("flaviagiammarino/vqa-rad", cache_dir=cache_dir)
@@ -135,7 +136,10 @@ if __name__ == "__main__":
     from transformers import Blip2Processor
     logging.basicConfig(level=logging.INFO)
 
-    processor = Blip2Processor.from_pretrained("Salesforce/blip2-opt-2.7b")
+    from transformers import BlipImageProcessor, AutoTokenizer
+    image_processor = BlipImageProcessor.from_pretrained("Salesforce/blip2-opt-2.7b")
+    tokenizer = AutoTokenizer.from_pretrained("Salesforce/blip2-opt-2.7b", use_fast=False)
+    processor = Blip2Processor(image_processor=image_processor, tokenizer=tokenizer)
     ds = VQARadDataset(split="train", processor=processor)
 
     print(f"Dataset size: {len(ds)}")
