@@ -70,7 +70,10 @@ CFG = {
 
 def load_model_and_processor(cfg: dict):
     logger.info("Loading processor…")
-    processor = Blip2Processor.from_pretrained(cfg["model_name"])
+    from transformers import BlipImageProcessor, AutoTokenizer
+    image_processor = BlipImageProcessor.from_pretrained(cfg["model_name"])
+    tokenizer = AutoTokenizer.from_pretrained(cfg["model_name"], use_fast=False)
+    processor = Blip2Processor(image_processor=image_processor, tokenizer=tokenizer)
 
     logger.info("Loading model in 4-bit…")
     bnb_config = BitsAndBytesConfig(
@@ -98,8 +101,8 @@ def load_model_and_processor(cfg: dict):
         target_modules=["q_proj", "v_proj"],
         bias="none",
     )
-    model = get_peft_model(model, lora_cfg)
-    model.print_trainable_parameters()
+    model.language_model = get_peft_model(model.language_model, lora_cfg)
+    model.language_model.print_trainable_parameters()
 
     # Fix repetition — must be set on generation_config, not generate() kwargs
     model.generation_config.repetition_penalty    = cfg["repetition_penalty"]
@@ -197,7 +200,7 @@ def train(cfg: dict, model, processor, train_dataset, val_dataset):
                 global_step += 1
                 epoch_loss += accum_loss
 
-                if global_step % 50 == 0:
+                if global_step % 5 == 0:
                     logger.info(
                         f"Epoch {epoch} | Step {global_step} | "
                         f"Loss {accum_loss * cfg['grad_accum_steps']:.4f} | "
@@ -281,6 +284,7 @@ def main():
         logger.info("SMOKE TEST: using 100 training samples, 1 epoch")
         from torch.utils.data import Subset
         train_ds = Subset(train_ds, list(range(min(100, len(train_ds)))))
+        val_ds   = Subset(val_ds,   list(range(min(20,  len(val_ds)))))
         CFG["epochs"] = 1
 
     # Must pass before wasting GPU time
