@@ -21,8 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 def _build_prompt(question: str) -> str:
-    """Unified prompt template — must match exactly in train + eval."""
-    return f"Question: {question} Answer:"
+    return f"Question: {question} Short answer:"
 
 
 class VQARadDataset(Dataset):

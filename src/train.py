@@ -32,6 +32,8 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+logger.setLevel(logging.INFO)
+logging.getLogger().setLevel(logging.INFO)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -90,7 +92,7 @@ def load_model_and_processor(cfg: dict):
     )
 
     logger.info("Preparing model for k-bit training…")
-    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=True)
+    model = prepare_model_for_kbit_training(model, use_gradient_checkpointing=False)
 
     logger.info("Attaching LoRA adapters…")
     lora_cfg = LoraConfig(
