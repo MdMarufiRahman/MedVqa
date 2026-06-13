@@ -214,7 +214,8 @@ def train(cfg: dict, model, processor, train_dataset, val_dataset):
 
         # --- Evaluate ---
         logger.info(f"Evaluating epoch {epoch}…")
-        metrics = evaluate(model, processor, val_loader, lm_device, cfg["max_new_tokens"])
+        # metrics = evaluate(model, processor, val_loader, lm_device, cfg["max_new_tokens"])
+        metrics = evaluate(model, processor, hf_test, lm_device, cfg["max_new_tokens"])
         logger.info(
             f"Epoch {epoch} | ROUGE-L: {metrics['rougeL']:.4f} | "
             f"ExactMatch: {metrics['exact_match']:.4f}"
@@ -286,7 +287,11 @@ def main():
         logger.info("SMOKE TEST: using 100 training samples, 1 epoch")
         from torch.utils.data import Subset
         train_ds = Subset(train_ds, list(range(min(100, len(train_ds)))))
-        val_ds   = Subset(val_ds,   list(range(min(20,  len(val_ds)))))
+        # val_ds   = Subset(val_ds,   list(range(min(20,  len(val_ds)))))
+        hf_test = hf_test.select(range(min(20, len(hf_test))))
+        from datasets import load_dataset
+        hf_test = load_dataset("flaviagiammarino/vqa-rad", 
+                        cache_dir=CFG["cache_dir"])["test"]
         CFG["epochs"] = 1
 
     # Must pass before wasting GPU time

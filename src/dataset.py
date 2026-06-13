@@ -98,7 +98,8 @@ class VQARadDataset(Dataset):
         # to the answer.  We mask [0 : prompt_len] and all padding.
         # +1 because processor may prepend a BOS token that shifts everything.
         # We try prompt_len first; if that leaves zero valid positions, fall back.
-        answer_start = min(prompt_len, input_ids.shape[0] - 1)
+        # answer_start = min(prompt_len, input_ids.shape[0] - 1)
+        answer_start = min(prompt_len + 1, input_ids.shape[0] - 1)
 
         # Mask prompt tokens
         labels[:answer_start] = -100
