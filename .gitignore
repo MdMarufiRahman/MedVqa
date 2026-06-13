@@ -20,3 +20,8 @@ data/
 wandb/
 
 checkpoints/blip2-medvqa
+checkpoints/
+results/train_history.json
+results/train_full.log
+results/eval_parity_check.json
+results/train_log.txt
